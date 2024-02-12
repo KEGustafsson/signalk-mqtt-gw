@@ -1,30 +1,15 @@
-/*
- * Copyright 2016 Teppo Kurki <teppo.kurki@iki.fi>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
-
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
-*/
-
 const id = 'signalk-mqtt-gw';
 const debug = require('debug')(id);
-const mosca = require('mosca');
+const aedes = require('aedes')();
+const mqttServer = require('net').createServer(aedes.handle);
 const mqtt = require('mqtt');
-const NeDBStore = require('mqtt-nedb-store');
 
 module.exports = function(app) {
   var plugin = {
     unsubscribes: [],
+    outgoingMessages: [], // Store outgoing messages in memory
   };
-  var server
+  var server;
 
   plugin.id = id;
   plugin.name = 'Signal K - MQTT Gateway';
@@ -105,38 +90,56 @@ module.exports = function(app) {
       startLocalServer(options, plugin.onStop);
     }
     if (options.sendToRemote) {
-      const manager = NeDBStore(app.getDataDirPath());
-      const client = mqtt.connect(options.remoteHost, {
-        rejectUnauthorized: options.rejectUnauthorized,
-        reconnectPeriod: 60000,
-        clientId: app.selfId,
-        outgoingStore: manager.outgoing,
-        username: options.username,
-        password: options.password
-      });
-      client.on('error', (err) => console.error(err))
-      startSending(options, client, plugin.onStop);
-      plugin.onStop.push(_ => client.end());
+      startSending(options, plugin.onStop);
     }
+
+    mqttServer.listen(options.port, function() {
+      console.log('Aedes MQTT server is up and running on port ' + options.port);
+    });
+
     started = true;
   };
 
   plugin.stop = function() {
     plugin.onStop.forEach(f => f());
+    mqttServer.close();
+    aedes.close();
   };
 
   return plugin;
 
-  function startSending(options, client, onStop) {
-    options.paths.forEach(pathInterval => {
+  function startSending(options, onStop) {
+    const client = mqtt.connect(options.remoteHost, {
+      rejectUnauthorized: options.rejectUnauthorized,
+      reconnectPeriod: 60000,
+      clientId: app.selfId,
+      username: options.username,
+      password: options.password
+    });
+
+    client.on('error', (err) => console.error(err))
+
+    client.on('connect', function () {
+      console.log('Connected to remote MQTT server');
+      // Resend any stored outgoing messages
+      plugin.outgoingMessages.forEach(message => {
+        client.publish(message.topic, message.payload, message.options);
+      });
+    });
+
+    client.on('offline', function () {
+      console.log('Disconnected from remote MQTT server');
+    });
+
+    plugin.paths.forEach(pathInterval => {
       onStop.push(
         app.streambundle
           .getSelfBus(pathInterval.path)
           .debounceImmediate(pathInterval.interval * 1000)
-          .onValue(normalizedPathValue =>
-            client.publish(
-              'signalk/delta',
-              JSON.stringify({
+          .onValue(normalizedPathValue => {
+            const message = {
+              topic: 'signalk/delta',
+              payload: JSON.stringify({
                 context: 'vessels.' + app.selfId,
                 updates: [
                   {
@@ -151,24 +154,45 @@ module.exports = function(app) {
                   },
                 ],
               }),
-              { qos: 1 }
-            )
-          )
+              options: { qos: 1 }
+            };
+            if (client.connected) {
+              client.publish(message.topic, message.payload, message.options);
+            } else {
+              plugin.outgoingMessages.push(message);
+            }
+          })
       );
     });
+
+    onStop.push(_ => client.end());
   }
 
   function startLocalServer(options, onStop) {
-    server = new mosca.Server(options);
+    aedes.authenticate = function(client, username, password, callback) {
+      // Your authentication logic here
+      callback(null, true); // Accept all connections for now
+    };
 
-    app.signalk.on('delta', publishLocalDelta);
-    onStop.push(_ => { app.signalk.removeListener('delta', publishLocalDelta) });
+    aedes.authorizePublish = function(client, packet, callback) {
+      // Your authorization logic here
+      callback(null); // Allow all publishes for now
+    };
 
-    server.on('clientConnected', function(client) {
-      console.log('client connected', client.id);
+    aedes.authorizeSubscribe = function(client, sub, callback) {
+      // Your authorization logic here
+      callback(null, sub); // Allow all subscriptions for now
+    };
+
+    aedes.on('client', function(client) {
+      console.log('Client connected: ', client.id);
     });
 
-    server.on('published', function(packet, client) {
+    aedes.on('clientDisconnect', function(client) {
+      console.log('Client disconnected: ', client.id);
+    });
+
+    aedes.on('publish', function(packet, client) {
       if (client) {
         var skData = extractSkData(packet);
         if (skData.valid) {
@@ -177,49 +201,30 @@ module.exports = function(app) {
       }
     });
 
-    server.on('ready', onReady);
-    // server.on('error', (err) => {
-    //   app.error(err)
-    // })
-
-    function onReady() {
-      try {
-        const mdns = require('mdns');
-        ad = mdns.createAdvertisement(mdns.tcp('mqtt'), options.port);
-        ad.start();
-      } catch (e) {
-        console.error(e.message);
-      }
+    mqttServer.on('listening', function() {
       console.log(
-        'Mosca MQTT server is up and running on port ' + options.port
+        'Aedes MQTT server is up and running on port ' + options.port
       );
-      onStop.push(_ => { server.close() });
-    }
-  }
-
-  function publishLocalDelta(delta) {
-    const prefix =
-      (delta.context === app.selfContext
-        ? 'vessels/self'
-        : delta.context.replace('.', '/')) + '/';
-    (delta.updates || []).forEach(update => {
-      (update.values || []).forEach(pathValue => {
-        server.publish({
-          topic: prefix + pathValue.path.replace(/\./g, '/'),
-          payload:
-            pathValue.value === null ? 'null' : toText(pathValue.value),
-          qos: 0,
-          retain: false,
-        });
-      });
     });
+
+    onStop.push(_ => { mqttServer.close() });
   }
 
-  function toText(value) {
-    if (typeof value === 'object') {
-      return JSON.stringify(value)
-    }
-    return value.toString()
+  function toDelta(skData, client) {
+    return {
+      context: skData.context,
+      updates: [
+        {
+          $source: 'mqtt.' + client.id.replace(/\//g, '_').replace(/\./g, '_'),
+          values: [
+            {
+              path: skData.path,
+              value: skData.value,
+            },
+          ],
+        },
+      ],
+    };
   }
 
   function extractSkData(packet) {
@@ -241,22 +246,5 @@ module.exports = function(app) {
     }
     result.valid = true;
     return result;
-  }
-
-  function toDelta(skData, client) {
-    return {
-      context: skData.context,
-      updates: [
-        {
-          $source: 'mqtt.' + client.id.replace(/\//g, '_').replace(/\./g, '_'),
-          values: [
-            {
-              path: skData.path,
-              value: skData.value,
-            },
-          ],
-        },
-      ],
-    };
   }
 };
