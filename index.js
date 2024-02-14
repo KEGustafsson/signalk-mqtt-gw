@@ -16,9 +16,7 @@
 
 const id = 'signalk-mqtt-gw';
 const debug = require('debug')(id);
-const mosca = require('mosca');
 const mqtt = require('mqtt');
-const NeDBStore = require('mqtt-nedb-store');
 
 module.exports = function(app) {
   var plugin = {
@@ -46,50 +44,6 @@ module.exports = function(app) {
         title: 'Local server port',
         default: 1883,
       },
-      sendToRemote: {
-        type: 'boolean',
-        title: 'Send data for paths listed below to remote server',
-        default: false,
-      },
-      remoteHost: {
-        type: 'string',
-        title: 'MQTT server Url (starts with mqtt/mqtts)',
-        description:
-          'MQTT server that the paths listed below should be sent to',
-        default: 'mqtt://somehost',
-      },
-      username: {
-        type: "string",
-        title: "MQTT server username"
-      },
-      password: {
-        type: "string",
-        title: "MQTT server password"
-      },
-      rejectUnauthorized: {
-        type: "boolean",
-        default: false,
-        title: "Reject self signed and invalid server certificates"
-      },
-      paths: {
-        type: 'array',
-        title: 'Signal K self paths to send',
-        default: [{ path: 'navigation.position', interval: 60 }],
-        items: {
-          type: 'object',
-          properties: {
-            path: {
-              type: 'string',
-              title: 'Path',
-            },
-            interval: {
-              type: 'number',
-              title:
-                'Minimum interval between updates for this path to be sent to the server',
-            },
-          },
-        },
-      },
     },
   };
 
@@ -104,20 +58,7 @@ module.exports = function(app) {
     if (options.runLocalServer) {
       startLocalServer(options, plugin.onStop);
     }
-    if (options.sendToRemote) {
-      const manager = NeDBStore(app.getDataDirPath());
-      const client = mqtt.connect(options.remoteHost, {
-        rejectUnauthorized: options.rejectUnauthorized,
-        reconnectPeriod: 60000,
-        clientId: app.selfId,
-        outgoingStore: manager.outgoing,
-        username: options.username,
-        password: options.password
-      });
-      client.on('error', (err) => console.error(err))
-      startSending(options, client, plugin.onStop);
-      plugin.onStop.push(_ => client.end());
-    }
+
     started = true;
   };
 
@@ -127,39 +68,15 @@ module.exports = function(app) {
 
   return plugin;
 
-  function startSending(options, client, onStop) {
-    options.paths.forEach(pathInterval => {
-      onStop.push(
-        app.streambundle
-          .getSelfBus(pathInterval.path)
-          .debounceImmediate(pathInterval.interval * 1000)
-          .onValue(normalizedPathValue =>
-            client.publish(
-              'signalk/delta',
-              JSON.stringify({
-                context: 'vessels.' + app.selfId,
-                updates: [
-                  {
-                    timestamp: normalizedPathValue.timestamp,
-                    $source: normalizedPathValue.$source,
-                    values: [
-                      {
-                        path: pathInterval.path,
-                        value: normalizedPathValue.value,
-                      },
-                    ],
-                  },
-                ],
-              }),
-              { qos: 1 }
-            )
-          )
-      );
-    });
-  }
-
   function startLocalServer(options, onStop) {
-    server = new mosca.Server(options);
+    const aedes = require('aedes')();
+    const server = require('net').createServer(aedes.handle)
+    const port = options.port || 1883;
+
+    server.listen(port, function() {
+      console.log('server listening on port', port)
+      aedes.publish({ topic: 'aedes/hello', payload: "I'm broker " + aedes.id })
+    })
 
     app.signalk.on('delta', publishLocalDelta);
     onStop.push(_ => { app.signalk.removeListener('delta', publishLocalDelta) });
@@ -191,7 +108,7 @@ module.exports = function(app) {
         console.error(e.message);
       }
       console.log(
-        'Mosca MQTT server is up and running on port ' + options.port
+        'Aedes MQTT server is up and running on port ' + options.port
       );
       onStop.push(_ => { server.close() });
     }
