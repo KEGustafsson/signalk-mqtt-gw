@@ -13,7 +13,7 @@
   "license": "ISC",
   "dependencies": {
     "aedes": "^0.51.0",
-    "debug": "^2.3.2",
+    "debug": "^4.4.0",
     "mqtt": "^5.3.5",
     "mqtt-jsonl-store": "^0.2.1"
   },
