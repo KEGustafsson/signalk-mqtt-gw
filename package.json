@@ -12,7 +12,7 @@
   "author": "teppo.kurki@iki,fi",
   "license": "ISC",
   "dependencies": {
-    "aedes": "^0.51.0",
+    "aedes": "^1.0.0",
     "debug": "^2.3.2",
     "mqtt": "^5.3.5",
     "mqtt-jsonl-store": "^0.2.1"
